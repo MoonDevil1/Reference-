@@ -1,0 +1,803 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import Hls from 'hls.js';
+import * as dashjs from 'dashjs';
+import { Channel, StreamDiagnosticsData } from '../types/channel';
+import {
+  Play, Pause, Volume2, VolumeX, Maximize, Minimize,
+  PictureInPicture, Activity, AlertTriangle,
+  ChevronLeft, ChevronRight, Settings2, Sparkles,
+  Sun, RotateCcw, RotateCw, Check
+} from 'lucide-react';
+import { getChannelEPG } from '../services/epgService';
+import { LiveTgtvIcon } from './Logo';
+
+interface LivePlayerProps {
+  channel: Channel | null;
+  onPrevChannel?: () => void;
+  onNextChannel?: () => void;
+  onOpenDiagnostics?: (data: StreamDiagnosticsData) => void;
+  onSelectUniversalChannel?: () => void;
+  aspectRatioMode?: 'fit' | 'fill' | '16-9' | '4-3';
+  isMuted?: boolean;
+  onToggleMute?: () => void;
+}
+
+export const LivePlayer: React.FC<LivePlayerProps> = ({
+  channel,
+  onPrevChannel,
+  onNextChannel,
+  onOpenDiagnostics,
+  onSelectUniversalChannel,
+  aspectRatioMode = '16-9',
+  isMuted = false,
+  onToggleMute,
+}) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const dashRef = useRef<dashjs.MediaPlayerClass | null>(null);
+  const wakeLockRef = useRef<any>(null);
+
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [volume, setVolume] = useState<number>(1); // 0 to 1
+  const [localMuted, setLocalMuted] = useState<boolean>(isMuted);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [aspectRatio, setAspectRatio] = useState<'fit' | 'fill' | '16-9' | '4-3'>(aspectRatioMode);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<number | string | undefined>(undefined);
+  const [controlsVisible, setControlsVisible] = useState<boolean>(true);
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
+
+  // On-screen touch gesture states (Reference app: com.genuine.leone)
+  const [brightness, setBrightness] = useState<number>(65); // 0% to 100%
+  const [activeGesture, setActiveGesture] = useState<'brightness' | 'volume' | null>(null);
+  const [doubleTapRipple, setDoubleTapRipple] = useState<'left' | 'right' | null>(null);
+  const [hasAutoplayMuted, setHasAutoplayMuted] = useState<boolean>(false);
+
+  // Touch tracking refs
+  const touchTrackingRef = useRef<{
+    startX: number;
+    startY: number;
+    startTime: number;
+    side: 'left' | 'right';
+    initialBrightness: number;
+    initialVolume: number;
+    isSwipe: boolean;
+  }>({
+    startX: 0,
+    startY: 0,
+    startTime: 0,
+    side: 'left',
+    initialBrightness: 65,
+    initialVolume: 1,
+    isSwipe: false,
+  });
+
+  const lastTapRef = useRef<{ time: number; x: number }>({ time: 0, x: 0 });
+
+  // Tracks & Levels
+  const [audioTracks, setAudioTracks] = useState<{ id: number; name: string }[]>([]);
+  const [selectedAudioTrack, setSelectedAudioTrack] = useState<number>(-1);
+  const [qualityLevels, setQualityLevels] = useState<{ id: number; height: number; bitrate: number }[]>([]);
+  const [selectedQuality, setSelectedQuality] = useState<number>(-1);
+
+  // Settings Panel & Timer
+  const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'general' | 'audio' | 'quality'>('general');
+  const [sleepTimer, setSleepTimer] = useState<number | null>(null);
+  const [sleepTimeRemaining, setSleepTimeRemaining] = useState<number | null>(null);
+  const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const gestureHideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const [diagnostics, setDiagnostics] = useState<StreamDiagnosticsData>({
+    streamUrl: channel?.streamUrl || '',
+    format: channel?.format || 'unknown',
+    drmType: channel?.drmType || 'none',
+    state: 'idle',
+  });
+
+  const epg = channel ? getChannelEPG(channel) : null;
+
+  // Screen Wake Lock
+  const requestWakeLock = useCallback(async () => {
+    try {
+      if ('wakeLock' in navigator && !wakeLockRef.current) {
+        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+      }
+    } catch {}
+  }, []);
+
+  const releaseWakeLock = useCallback(async () => {
+    if (wakeLockRef.current) {
+      try {
+        await wakeLockRef.current.release();
+        wakeLockRef.current = null;
+      } catch {}
+    }
+  }, []);
+
+  // Sleep Timer
+  useEffect(() => {
+    if (!sleepTimer) {
+      setSleepTimeRemaining(null);
+      return;
+    }
+    setSleepTimeRemaining(sleepTimer * 60);
+    const interval = setInterval(() => {
+      setSleepTimeRemaining((prev) => {
+        if (prev === null || prev <= 1) {
+          clearInterval(interval);
+          if (videoRef.current) {
+            videoRef.current.pause();
+            setIsPlaying(false);
+          }
+          setSleepTimer(null);
+          return null;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [sleepTimer]);
+
+  // Clean up all players
+  const destroyCurrentPlayers = useCallback(() => {
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+    if (dashRef.current) {
+      dashRef.current.destroy();
+      dashRef.current = null;
+    }
+  }, []);
+
+  // Auto-hide controls after inactivity
+  const resetControlsTimeout = useCallback(() => {
+    if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
+    controlsTimeoutRef.current = setTimeout(() => {
+      if (isPlaying) {
+        setControlsVisible(false);
+        setShowSettings(false);
+      }
+    }, 4500);
+  }, [isPlaying]);
+
+  // Tap-to-show overlay controls toggle
+  const toggleOverlayControls = useCallback(() => {
+    setControlsVisible((prev) => {
+      const next = !prev;
+      if (next) {
+        resetControlsTimeout();
+      } else {
+        setShowSettings(false);
+      }
+      return next;
+    });
+  }, [resetControlsTimeout]);
+
+  // Load stream with HLS, DASH, or HTML5
+  useEffect(() => {
+    if (!channel || !channel.streamUrl) {
+      setErrorMessage(null);
+      setIsLoading(false);
+      return;
+    }
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    setIsLoading(true);
+    setErrorMessage(null);
+    setErrorCode(undefined);
+    destroyCurrentPlayers();
+
+    const streamUrl = channel.streamUrl;
+    const isHls = streamUrl.includes('.m3u8') || channel.format === 'hls';
+    const isDash = streamUrl.includes('.mpd') || channel.format === 'dash';
+
+    setDiagnostics({
+      streamUrl,
+      format: channel.format,
+      drmType: channel.drmType,
+      licenseKey: channel.licenseKey,
+      userAgent: channel.userAgent,
+      cookie: channel.cookie,
+      referer: channel.referer,
+      state: 'buffering',
+    });
+
+    // Safe playback with browser autoplay policy fallback
+    const attemptPlay = async () => {
+      try {
+        await video.play();
+        setIsPlaying(true);
+        requestWakeLock();
+      } catch (err: any) {
+        if (
+          err.name === 'NotAllowedError' ||
+          err.message?.toLowerCase().includes('interact') ||
+          err.message?.toLowerCase().includes('gesture')
+        ) {
+          video.muted = true;
+          setLocalMuted(true);
+          setHasAutoplayMuted(true);
+          try {
+            await video.play();
+            setIsPlaying(true);
+            requestWakeLock();
+          } catch {
+            setIsPlaying(false);
+          }
+        } else {
+          setIsPlaying(false);
+        }
+      }
+    };
+
+    if (isHls && Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 90,
+      });
+
+      hlsRef.current = hls;
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        setIsLoading(false);
+        attemptPlay();
+
+        if (hls.levels && hls.levels.length > 0) {
+          setQualityLevels(
+            hls.levels.map((lvl, index) => ({
+              id: index,
+              height: lvl.height,
+              bitrate: lvl.bitrate,
+            }))
+          );
+        }
+
+        if (data.audioTracks && data.audioTracks.length > 0) {
+          setAudioTracks(data.audioTracks.map((t, idx) => ({ id: idx, name: t.name || `Audio Track ${idx + 1}` })));
+        } else {
+          setAudioTracks([]);
+        }
+
+        setDiagnostics((prev) => ({
+          ...prev,
+          state: 'playing',
+          resolution: video.videoWidth ? `${video.videoWidth}x${video.videoHeight}` : '1080p',
+        }));
+      });
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          setIsLoading(false);
+          setIsPlaying(false);
+          const status = data.response?.code;
+          setErrorCode(status || 'HLS_FATAL');
+
+          let msg = 'Playback error occurred';
+          if (status === 403) {
+            msg = 'HTTP 403: CDN token expired or carrier auth required.';
+          } else if (status === 404) {
+            msg = 'HTTP 404: Broadcast endpoint offline.';
+          } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            msg = 'CORS / Network Error: Direct web access restricted by broadcaster CDN. Native Android ExoPlayer connects directly via OkHttp.';
+          } else {
+            msg = `Playback error: ${data.details || 'Decoding error'}`;
+          }
+
+          setErrorMessage(msg);
+          setDiagnostics((prev) => ({
+            ...prev,
+            state: 'error',
+            errorMessage: msg,
+            errorCode: status || data.details,
+          }));
+        }
+      });
+    } else if (isDash) {
+      try {
+        const dashPlayer = dashjs.MediaPlayer().create();
+        dashRef.current = dashPlayer;
+
+        dashPlayer.updateSettings({
+          debug: {
+            logLevel: dashjs.Debug.LOG_LEVEL_NONE,
+          },
+          streaming: {
+            protection: {
+              keepProtectionMediaKeys: true,
+              ignoreEmeEncryptedEvent: false,
+            },
+          },
+        });
+
+        const protectionData: Record<string, any> = {};
+
+        if (channel.licenseKey) {
+          const clearkeys: Record<string, string> = {};
+          const pairs = channel.licenseKey.split(',');
+          for (const pair of pairs) {
+            const parts = pair.trim().split(':');
+            if (parts.length === 2) {
+              clearkeys[parts[0].trim()] = parts[1].trim();
+            }
+          }
+
+          if (Object.keys(clearkeys).length > 0) {
+            protectionData['org.w3.clearkey'] = {
+              clearkeys,
+              priority: 0,
+            };
+          }
+        }
+
+        const widevineServerUrl =
+          channel.licenseUrl ||
+          (channel.licenseKey && (channel.licenseKey.startsWith('http://') || channel.licenseKey.startsWith('https://'))
+            ? channel.licenseKey
+            : undefined);
+
+        if (widevineServerUrl) {
+          protectionData['com.widevine.alpha'] = {
+            serverURL: widevineServerUrl,
+            httpRequestHeaders: channel.extraHeaders || {},
+            priority: 1,
+          };
+        }
+
+        if (Object.keys(protectionData).length > 0) {
+          dashPlayer.setProtectionData(protectionData);
+        }
+
+        dashPlayer.initialize(video, streamUrl, true);
+
+        dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+          setIsLoading(false);
+          attemptPlay();
+          setDiagnostics((prev) => ({
+            ...prev,
+            state: 'playing',
+            resolution: video.videoWidth ? `${video.videoWidth}x${video.videoHeight}` : '720p',
+          }));
+        });
+
+        dashPlayer.on(dashjs.MediaPlayer.events.ERROR, (e: any) => {
+          setIsLoading(false);
+          setIsPlaying(false);
+          const errCode = e?.error?.code || e?.event?.id;
+          setErrorCode(errCode || 'DASH_ERROR');
+
+          let msg = 'MPEG-DASH stream error';
+          if (streamUrl.includes('jio.com')) {
+            msg = 'HTTP 451 / Carrier Geo-Restricted: Jio TV streams require an Indian IP address or active Jio SIM network. On an Android phone with Jio SIM, the native ExoPlayer app streams this seamlessly.';
+          } else {
+            msg = `MPEG-DASH error (${e?.error?.message || 'Decryption or network failure'})`;
+          }
+
+          setErrorMessage(msg);
+          setDiagnostics((prev) => ({
+            ...prev,
+            state: 'error',
+            errorMessage: msg,
+            errorCode: errCode,
+          }));
+        });
+      } catch (err: any) {
+        setIsLoading(false);
+        setErrorMessage(`Dash engine initialization failed: ${err.message}`);
+      }
+    } else {
+      video.src = streamUrl;
+      video.load();
+      video.onloadeddata = () => {
+        setIsLoading(false);
+        attemptPlay();
+      };
+      video.onerror = () => {
+        setIsLoading(false);
+        attemptPlay().catch(() => {
+          setErrorMessage('Playback error: Stream format or network issue.');
+        });
+      };
+    }
+
+    return () => {
+      destroyCurrentPlayers();
+      releaseWakeLock();
+    };
+  }, [channel, requestWakeLock, releaseWakeLock, destroyCurrentPlayers]);
+
+  // Sync mute
+  useEffect(() => {
+    setLocalMuted(isMuted);
+    if (videoRef.current) {
+      videoRef.current.muted = isMuted;
+    }
+  }, [isMuted]);
+
+  const togglePlay = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (isPlaying) {
+      video.pause();
+      setIsPlaying(false);
+      releaseWakeLock();
+    } else {
+      video.play().then(() => {
+        setIsPlaying(true);
+        requestWakeLock();
+      }).catch(() => {});
+    }
+  };
+
+  // Touch and pointer gesture processing
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const isLeft = x < rect.width * 0.5;
+
+    // Double tap detection
+    const now = Date.now();
+    if (now - lastTapRef.current.time < 300 && Math.abs(x - lastTapRef.current.x) < 60) {
+      const video = videoRef.current;
+      if (video) {
+        if (x < rect.width * 0.35) {
+          video.currentTime = Math.max(0, video.currentTime - 10);
+          setDoubleTapRipple('left');
+          setTimeout(() => setDoubleTapRipple(null), 500);
+        } else if (x > rect.width * 0.65) {
+          video.currentTime = Math.min(video.duration || 999999, video.currentTime + 10);
+          setDoubleTapRipple('right');
+          setTimeout(() => setDoubleTapRipple(null), 500);
+        }
+      }
+      lastTapRef.current = { time: 0, x: 0 };
+      touchTrackingRef.current.startTime = 0;
+      return;
+    }
+
+    lastTapRef.current = { time: now, x };
+
+    touchTrackingRef.current = {
+      startX: x,
+      startY: y,
+      startTime: now,
+      side: isLeft ? 'left' : 'right',
+      initialBrightness: brightness,
+      initialVolume: localMuted ? 0 : volume,
+      isSwipe: false,
+    };
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!touchTrackingRef.current.startTime) return;
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const currentY = e.clientY - rect.top;
+    const currentX = e.clientX - rect.left;
+    const deltaY = touchTrackingRef.current.startY - currentY; // Up is positive
+    const deltaX = Math.abs(currentX - touchTrackingRef.current.startX);
+
+    if (!touchTrackingRef.current.isSwipe && Math.abs(deltaY) > 8 && Math.abs(deltaY) > deltaX) {
+      touchTrackingRef.current.isSwipe = true;
+    }
+
+    if (touchTrackingRef.current.isSwipe) {
+      const height = rect.height || 300;
+      const percentDelta = (deltaY / (height * 0.7)) * 100;
+
+      if (touchTrackingRef.current.side === 'left') {
+        // Vertical swipe on left: Brightness
+        const newBrightness = Math.min(100, Math.max(5, Math.round(touchTrackingRef.current.initialBrightness + percentDelta)));
+        setBrightness(newBrightness);
+        setActiveGesture('brightness');
+      } else {
+        // Vertical swipe on right: Volume
+        const volDelta = deltaY / (height * 0.7);
+        const newVolume = Math.min(1, Math.max(0, touchTrackingRef.current.initialVolume + volDelta));
+        setVolume(newVolume);
+        if (videoRef.current) {
+          videoRef.current.volume = newVolume;
+          if (newVolume > 0 && localMuted) {
+            setLocalMuted(false);
+            videoRef.current.muted = false;
+          }
+        }
+        setActiveGesture('volume');
+      }
+
+      if (gestureHideTimeoutRef.current) clearTimeout(gestureHideTimeoutRef.current);
+      gestureHideTimeoutRef.current = setTimeout(() => {
+        setActiveGesture(null);
+      }, 1200);
+    }
+  };
+
+  const handlePointerUp = () => {
+    if (touchTrackingRef.current.startTime) {
+      const duration = Date.now() - touchTrackingRef.current.startTime;
+      if (!touchTrackingRef.current.isSwipe && duration < 350) {
+        toggleOverlayControls();
+      }
+      touchTrackingRef.current.startTime = 0;
+      touchTrackingRef.current.isSwipe = false;
+    }
+  };
+
+  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setVolume(val);
+    if (videoRef.current) {
+      videoRef.current.volume = val;
+      if (val > 0 && localMuted) {
+        setLocalMuted(false);
+        videoRef.current.muted = false;
+      }
+    }
+  };
+
+  const handleToggleMute = () => {
+    const nextMuted = !localMuted;
+    setLocalMuted(nextMuted);
+    if (videoRef.current) videoRef.current.muted = nextMuted;
+    if (onToggleMute) onToggleMute();
+  };
+
+  const toggleFullscreen = () => {
+    if (!containerRef.current) return;
+    if (!document.fullscreenElement) {
+      containerRef.current.requestFullscreen().catch(() => {});
+      setIsFullscreen(true);
+    } else {
+      document.exitFullscreen().catch(() => {});
+      setIsFullscreen(false);
+    }
+  };
+
+  const togglePictureInPicture = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else if (document.pictureInPictureEnabled) {
+        await video.requestPictureInPicture();
+      }
+    } catch {}
+  };
+
+  const getAspectClass = () => {
+    switch (aspectRatio) {
+      case 'fill': return 'w-full h-full object-fill';
+      case 'fit': return 'w-full h-full object-contain';
+      case '4-3': return 'w-full h-full object-cover aspect-[4/3]';
+      case '16-9':
+      default: return 'w-full h-full object-contain aspect-video';
+    }
+  };
+
+  const cssBrightnessMultiplier = 0.2 + (brightness / 100) * 1.3;
+
+  return (
+    <div
+      ref={containerRef}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      className="relative w-full h-full bg-black rounded-2xl overflow-hidden flex items-center justify-center select-none group touch-none cursor-pointer"
+      style={{ filter: `brightness(${cssBrightnessMultiplier})` }}
+    >
+      <video
+        ref={videoRef}
+        playsInline
+        className={`${getAspectClass()} transition-all duration-200 pointer-events-none`}
+      />
+
+      {/* Brightness HUD (Left Swipe) */}
+      {activeGesture === 'brightness' && (
+        <div className="absolute left-6 top-1/2 -translate-y-1/2 z-40 pointer-events-none flex flex-col items-center gap-2 p-3 rounded-2xl bg-black/85 backdrop-blur-md border border-slate-700/80 text-white shadow-2xl">
+          <Sun className="w-5 h-5 text-amber-400" />
+          <div className="w-2.5 h-32 bg-slate-800/90 rounded-full overflow-hidden flex flex-col justify-end p-0.5">
+            <div className="w-full bg-gradient-to-t from-amber-500 to-amber-300 rounded-full" style={{ height: `${brightness}%` }} />
+          </div>
+          <span className="text-[11px] font-mono font-bold text-amber-300">{brightness}%</span>
+        </div>
+      )}
+
+      {/* Volume HUD (Right Swipe) */}
+      {activeGesture === 'volume' && (
+        <div className="absolute right-6 top-1/2 -translate-y-1/2 z-40 pointer-events-none flex flex-col items-center gap-2 p-3 rounded-2xl bg-black/85 backdrop-blur-md border border-slate-700/80 text-white shadow-2xl">
+          {localMuted || volume === 0 ? <VolumeX className="w-5 h-5 text-rose-400" /> : <Volume2 className="w-5 h-5 text-cyan-400" />}
+          <div className="w-2.5 h-32 bg-slate-800/90 rounded-full overflow-hidden flex flex-col justify-end p-0.5">
+            <div className="w-full bg-gradient-to-t from-cyan-500 to-blue-400 rounded-full" style={{ height: `${Math.round((localMuted ? 0 : volume) * 100)}%` }} />
+          </div>
+          <span className="text-[11px] font-mono font-bold text-cyan-300">{Math.round((localMuted ? 0 : volume) * 100)}%</span>
+        </div>
+      )}
+
+      {/* Double Tap Feedback */}
+      {doubleTapRipple === 'left' && (
+        <div className="absolute left-8 top-1/2 -translate-y-1/2 pointer-events-none z-40 flex flex-col items-center gap-1 text-cyan-400">
+          <div className="p-3 rounded-full bg-black/70 backdrop-blur-sm border border-cyan-500/50">
+            <RotateCcw className="w-8 h-8" />
+          </div>
+          <span className="text-xs font-bold font-mono text-cyan-300">-10s</span>
+        </div>
+      )}
+      {doubleTapRipple === 'right' && (
+        <div className="absolute right-8 top-1/2 -translate-y-1/2 pointer-events-none z-40 flex flex-col items-center gap-1 text-cyan-400">
+          <div className="p-3 rounded-full bg-black/70 backdrop-blur-sm border border-cyan-500/50">
+            <RotateCw className="w-8 h-8" />
+          </div>
+          <span className="text-xs font-bold font-mono text-cyan-300">+10s</span>
+        </div>
+      )}
+
+      {/* Autoplay Muted Banner */}
+      {hasAutoplayMuted && isPlaying && localMuted && (
+        <div
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            handleToggleMute();
+            setHasAutoplayMuted(false);
+          }}
+          className="absolute top-16 left-1/2 -translate-x-1/2 z-40 px-3.5 py-1.5 rounded-full bg-cyan-950/90 border border-cyan-500/60 text-cyan-300 text-xs font-semibold shadow-2xl flex items-center gap-2 cursor-pointer hover:bg-cyan-900 transition-colors animate-pulse"
+        >
+          <VolumeX className="w-3.5 h-3.5 text-rose-400" />
+          <span>Stream Playing (Muted for Autoplay) · Tap to Unmute</span>
+        </div>
+      )}
+
+      {/* Loading Overlay */}
+      {isLoading && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-xs z-20 pointer-events-none">
+          <div className="w-12 h-12 rounded-full border-3 border-cyan-500/30 border-t-cyan-400 animate-spin" />
+          <p className="mt-3 text-xs font-medium text-cyan-200 tracking-wide">Connecting to live stream...</p>
+        </div>
+      )}
+
+      {/* Error / Fallback Card */}
+      {errorMessage && (
+        <div onPointerDown={(e) => e.stopPropagation()} className="absolute inset-0 flex items-center justify-center p-6 bg-slate-950/92 backdrop-blur-md z-30">
+          <div className="max-w-md w-full p-5 rounded-2xl bg-slate-900 border border-slate-800 text-center shadow-2xl">
+            <div className="inline-flex p-3 rounded-full bg-rose-500/10 border border-rose-500/30 text-rose-400 mb-3">
+              <AlertTriangle className="w-6 h-6" />
+            </div>
+            <h4 className="text-base font-bold text-white mb-1">Stream Notice & Geo-Policy</h4>
+            <p className="text-xs text-slate-300 leading-relaxed mb-4">{errorMessage}</p>
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-2">
+              {onSelectUniversalChannel && (
+                <button
+                  onClick={onSelectUniversalChannel}
+                  className="w-full sm:w-auto px-4 py-2.5 text-xs font-bold text-slate-950 bg-gradient-to-r from-cyan-400 to-blue-400 hover:opacity-90 rounded-xl transition-opacity flex items-center justify-center gap-1.5 shadow-lg shadow-cyan-500/20"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  Play Working Live Channel Now
+                </button>
+              )}
+              <button
+                onClick={() => onOpenDiagnostics && onOpenDiagnostics(diagnostics)}
+                className="w-full sm:w-auto px-4 py-2 text-xs font-semibold text-white bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors flex items-center justify-center gap-1.5 border border-slate-700"
+              >
+                <Activity className="w-4 h-4 text-cyan-400" />
+                View Diagnostics
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Idle state */}
+      {!channel && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 text-slate-400 p-6 z-10 pointer-events-none">
+          <LiveTgtvIcon size={64} className="opacity-80 mb-4" />
+          <h3 className="text-lg font-bold text-white">LiveTGTV Ready</h3>
+          <p className="text-xs text-slate-400 mt-1 max-w-sm text-center">Select a live TV channel from the guide or enter a Network Stream URL.</p>
+        </div>
+      )}
+
+      {/* OSD Overlay Controls */}
+      {channel && (
+        <div className={`absolute inset-0 flex flex-col justify-between p-4 bg-gradient-to-t from-black/85 via-transparent to-black/65 pointer-events-none transition-opacity duration-300 z-20 ${controlsVisible || !isPlaying ? 'opacity-100' : 'opacity-0'}`}>
+          {/* Top Bar OSD */}
+          <div className="flex items-start justify-between gap-4 pointer-events-none">
+            <div onPointerDown={(e) => e.stopPropagation()} className="flex items-center gap-3 pointer-events-auto">
+              {channel.logoUrl ? (
+                <div className="w-12 h-12 rounded-xl bg-slate-900/90 border border-slate-700/80 p-1 flex items-center justify-center overflow-hidden shadow-md shrink-0">
+                  <img src={channel.logoUrl} alt={channel.name} referrerPolicy="no-referrer" className="max-h-full max-w-full object-contain" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} />
+                </div>
+              ) : (
+                <div className="w-12 h-12 rounded-xl bg-slate-900/90 border border-slate-700/80 flex items-center justify-center text-cyan-400 font-bold shrink-0">
+                  <LiveTgtvIcon size={24} />
+                </div>
+              )}
+              <div className="flex flex-col text-left">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono font-bold text-cyan-400 bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-800/40">CH {channel.channelNumber}</span>
+                  <h3 className="text-sm sm:text-base font-bold text-white tracking-tight drop-shadow truncate max-w-[200px] sm:max-w-md">{channel.name}</h3>
+                </div>
+                {epg && (
+                  <div className="flex items-center gap-1.5 text-xs text-slate-300 mt-0.5">
+                    <span className="font-medium text-white truncate max-w-[180px] sm:max-w-xs">{epg.current.title}</span>
+                    <span className="text-slate-500">·</span>
+                    <span className="text-[11px] text-slate-400 font-mono">{epg.current.startTime} - {epg.current.endTime}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div onPointerDown={(e) => e.stopPropagation()} className="flex items-center gap-2 pointer-events-auto">
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-rose-600/90 text-white text-[11px] font-bold tracking-wider uppercase shadow-md">
+                <span className="w-2 h-2 rounded-full bg-white animate-pulse" /> LIVE
+              </div>
+              <button onClick={() => onOpenDiagnostics && onOpenDiagnostics(diagnostics)} className="p-2 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/60 shadow-sm" title="Stream Diagnostics">
+                <Activity className="w-4 h-4 text-cyan-400" />
+              </button>
+              <button onClick={() => setShowSettings(!showSettings)} className="p-2 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/60 shadow-sm" title="Player Settings">
+                <Settings2 className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* Center Playback Zappers */}
+          <div className="flex items-center justify-between px-2 sm:px-6 pointer-events-none">
+            {onPrevChannel && (
+              <button onPointerDown={(e) => e.stopPropagation()} onClick={onPrevChannel} className="p-3 rounded-full bg-black/40 hover:bg-black/70 text-white/80 hover:text-white transition-all transform hover:scale-110 pointer-events-auto" title="Previous Channel">
+                <ChevronLeft className="w-6 h-6" />
+              </button>
+            )}
+            <button onPointerDown={(e) => e.stopPropagation()} onClick={togglePlay} className="p-4 rounded-full bg-cyan-500/90 hover:bg-cyan-400 text-slate-950 shadow-xl shadow-cyan-500/20 transition-transform transform hover:scale-105 active:scale-95 pointer-events-auto" title={isPlaying ? 'Pause' : 'Play'}>
+              {isPlaying ? <Pause className="w-8 h-8 fill-current" /> : <Play className="w-8 h-8 fill-current translate-x-0.5" />}
+            </button>
+            {onNextChannel && (
+              <button onPointerDown={(e) => e.stopPropagation()} onClick={onNextChannel} className="p-3 rounded-full bg-black/40 hover:bg-black/70 text-white/80 hover:text-white transition-all transform hover:scale-110 pointer-events-auto" title="Next Channel">
+                <ChevronRight className="w-6 h-6" />
+              </button>
+            )}
+          </div>
+
+          {/* Bottom Bar OSD with Live Progress & Volume */}
+          <div className="space-y-2 pointer-events-none">
+            {epg && (
+              <div className="w-full bg-slate-800/80 h-1.5 rounded-full overflow-hidden">
+                <div className="bg-gradient-to-r from-cyan-400 to-blue-500 h-full transition-all duration-1000" style={{ width: `${epg.current.progressPercent}%` }} />
+              </div>
+            )}
+            <div onPointerDown={(e) => e.stopPropagation()} className="flex items-center justify-between text-xs text-white pointer-events-auto">
+              <div className="flex items-center gap-3">
+                <button onClick={togglePlay} className="p-1.5 hover:text-cyan-400 transition-colors" title={isPlaying ? 'Pause' : 'Play'}>
+                  {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+                </button>
+                <div className="flex items-center gap-1.5">
+                  <button onClick={handleToggleMute} className="p-1.5 hover:text-cyan-400 transition-colors" title={localMuted ? 'Unmute' : 'Mute'}>
+                    {localMuted || volume === 0 ? <VolumeX className="w-5 h-5 text-rose-400" /> : <Volume2 className="w-5 h-5" />}
+                  </button>
+                  <input type="range" min="0" max="1" step="0.05" value={localMuted ? 0 : volume} onChange={handleVolumeChange} className="w-16 sm:w-20 accent-cyan-400 h-1 bg-slate-700 rounded-lg cursor-pointer" />
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={togglePictureInPicture} className="p-1.5 hover:text-cyan-400 transition-colors" title="Picture in Picture">
+                  <PictureInPicture className="w-5 h-5" />
+                </button>
+                <button onClick={toggleFullscreen} className="p-1.5 hover:text-cyan-400 transition-colors" title="Fullscreen">
+                  {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
